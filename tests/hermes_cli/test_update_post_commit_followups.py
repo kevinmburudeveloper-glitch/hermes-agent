@@ -190,6 +190,36 @@ def test_owed_restart_names_its_gateways_so_a_dead_fleet_cannot_discharge_it(tmp
     assert fleet._fleet_restart_obligation_armed()
 
 
+def test_a_mapped_gateway_stopped_without_relaunch_records_one_row(tmp_path, monkeypatch):
+    """A PID in both the plan and ``stopped_unmapped_pids`` must not produce two inventory rows.
+
+    ``_restart_manual_gateways`` adds a profile gateway it could not arm a relaunch for to
+    ``stopped_unmapped_pids``. Recording that PID again as a profile-less row made an obligation
+    no live gateway could satisfy, so the warning never discharged.
+    """
+    from hermes_cli import update_cmd_fleet as fleet
+    from hermes_cli import update_cmd_fleet_verify as fleet_verify
+    from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+    fleet._write_fleet_restart_pending_marker(expected_sha="a" * 40)
+    plan = UpdatePlan(runtimes=[RuntimeRecord(kind="gateway", profile="default", pid=4242)])
+
+    fleet_verify._record_owed_gateway_inventory(plan, stopped_unmapped_pids=[4242, 5151])
+    inventory = json.loads(fleet._obligation_fields()["inventory"])
+    assert [(r["kind"], r["profile"], r["pid"]) for r in inventory["runtimes"]] == [
+        ("gateway", "default", 4242), ("gateway", None, 5151)]
+
+    # Idempotent: a repeat with the same inputs adds nothing.
+    fleet_verify._record_owed_gateway_inventory(plan, stopped_unmapped_pids=[4242, 5151])
+    assert json.loads(fleet._obligation_fields()["inventory"]) == inventory
+
+    # A later catch-up whose plan is empty must not re-record an already-mapped PID as unmapped.
+    fleet_verify._record_owed_gateway_inventory(UpdatePlan(runtimes=[]), stopped_unmapped_pids=[4242])
+    assert json.loads(fleet._obligation_fields()["inventory"]) == inventory
+
+
 def test_owed_restart_rearms_a_settled_obligation_and_a_later_run_keeps_owing_it(tmp_path, monkeypatch):
     # A pre-restart probe can settle an inventory-less record; the owed restart must re-arm it, and
     # a later verify that finds nothing to restart must keep owing the named gateway.

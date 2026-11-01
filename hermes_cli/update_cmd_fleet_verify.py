@@ -210,13 +210,23 @@ def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=()) -> None:
             return
         recorded = inventory["runtimes"]
     from dataclasses import asdict
-    rows = [
+    mapped_rows = [
         asdict(runtime) for runtime in getattr(plan, "runtimes", ()) or ()
         if getattr(runtime, "kind", None) == "gateway"
         and isinstance(getattr(runtime, "profile", None), str)
         and runtime.profile.strip() and runtime.profile != "unknown"
-    ] + [{"kind": "gateway", "profile": None, "pid": pid, "stopped_unmapped": True}
-         for pid in sorted(stopped_unmapped_pids)]
+    ]
+    # The same PID can be both a mapped plan runtime and a "could not arm its relaunch" stop.
+    # Recording it twice added a profile-less row that no live gateway can ever cover, so the
+    # marker stayed armed forever (#stuck-owed-restart). The mapped row already owes the restart;
+    # an unmapped row is only for a PID with no known profile anywhere.
+    mapped_pids = {row.get("pid") for row in mapped_rows}
+    mapped_pids |= {row.get("pid") for row in recorded
+                    if isinstance(row, dict) and row.get("profile")}
+    rows = mapped_rows + [
+        {"kind": "gateway", "profile": None, "pid": pid, "stopped_unmapped": True}
+        for pid in sorted(stopped_unmapped_pids) if pid not in mapped_pids
+    ]
     rows = [row for row in rows if row not in recorded]
     if rows:
         # Not armed any more (a pre-restart probe settled an inventory-less record): re-arm, the
