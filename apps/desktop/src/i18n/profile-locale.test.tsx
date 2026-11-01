@@ -4,11 +4,13 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { setApiRequestConnection } from '@/api/client'
 import type { HermesApiRequest } from '@/global'
 import type { HermesConfigRecord } from '@/hermes'
+import { $gateway } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $connection } from '@/store/session'
+import { $connection, $gatewayState } from '@/store/session'
 
 import { useI18n } from './context'
 import { ProfileI18nProvider as I18nProvider } from './profile-provider'
+import { resetAppLocaleRegistry } from './registry'
 
 function Probe() {
   const { locale, setLocale, saveError, isSavingLocale } = useI18n()
@@ -31,6 +33,9 @@ function route(profile: string, connectionId: string | null = null) {
 
 afterEach(() => {
   cleanup()
+  $gateway.set(null)
+  $gatewayState.set('idle')
+  resetAppLocaleRegistry()
   route('default')
   Reflect.deleteProperty(window, 'hermesDesktop')
   vi.restoreAllMocks()
@@ -144,4 +149,88 @@ it('isolates stale reads and failed saves when the same profile moves between co
   api.mockImplementation(() => Promise.resolve({ display: { language: 'ar' } }))
   act(() => $connection.set({ baseUrl: 'https://second.example' } as never))
   await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ar'))
+})
+
+// Boot reports the socket `open` before the client is published in `$gateway`.
+// The backend-pack sync must still run once the client arrives, or a language
+// only a pack renders (ko via hermes-lang-ko) never leaves English.
+it('pulls the backend language pack once the gateway client is published after the socket opened', async () => {
+  window.hermesDesktop = { api: vi.fn(async () => ({ display: { language: 'ko' } })) } as never
+
+  const request = vi.fn(async (method: string) =>
+    method === 'i18n.languages'
+      ? {
+          languages: [
+            {
+              id: 'ko',
+              endonym: '한국어',
+              rtl: false,
+              source: 'plugin:hermes-lang-ko',
+              surfaces: ['core', 'tui', 'desktop']
+            }
+          ]
+        }
+      : { lang: 'ko', surface: 'desktop', messages: { 'common.save': '저장' } }
+  )
+
+  act(() => $gatewayState.set('open'))
+  render(
+    <I18nProvider>
+      <Probe />
+    </I18nProvider>
+  )
+  await waitFor(() => expect(window.hermesDesktop.api).toHaveBeenCalled())
+  expect(request).not.toHaveBeenCalled()
+
+  act(() => $gateway.set({ request } as never))
+  await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ko'))
+  expect(request).toHaveBeenCalledWith('i18n.catalog', { lang: 'ko', surface: 'desktop' })
+})
+
+// The OS-language probe can finish after the pack sync promoted the saved
+// language; the probe's answer must not replace it.
+it('keeps a pack-rendered saved language when the OS-language probe resolves after the pack', async () => {
+  let resolveProfile: (profile: { locale: string }) => void = () => undefined
+
+  const machineProfile = new Promise<{ locale: string }>(resolve => {
+    resolveProfile = resolve
+  })
+
+  window.hermesDesktop = {
+    api: vi.fn(async () => ({ display: { language: 'ko' } })),
+    getMachineProfile: vi.fn(() => machineProfile)
+  } as never
+
+  const request = vi.fn(async (method: string) =>
+    method === 'i18n.languages'
+      ? {
+          languages: [
+            {
+              id: 'ko',
+              endonym: '한국어',
+              rtl: false,
+              source: 'plugin:hermes-lang-ko',
+              surfaces: ['core', 'tui', 'desktop']
+            }
+          ]
+        }
+      : { lang: 'ko', surface: 'desktop', messages: { 'common.save': '저장' } }
+  )
+
+  act(() => $gatewayState.set('open'))
+  render(
+    <I18nProvider>
+      <Probe />
+    </I18nProvider>
+  )
+  await waitFor(() => expect(window.hermesDesktop.getMachineProfile).toHaveBeenCalled())
+
+  act(() => $gateway.set({ request } as never))
+  await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ko'))
+
+  await act(async () => {
+    resolveProfile({ locale: 'en-US' })
+    await machineProfile
+  })
+  expect(screen.getByTestId('locale').textContent).toBe('ko')
 })
