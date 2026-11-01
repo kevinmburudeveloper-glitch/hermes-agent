@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 from hermes_cli.config import DEFAULT_CONFIG
 
@@ -239,6 +240,83 @@ def is_global_startup_conflict(error_code: str | None) -> bool:
     return bool(code) and (code == "lock_conflict" or code.endswith("_lock"))
 
 
+# Markers systemd exports to a unit's whole process tree, not just its MainPID. A gateway started
+# from a terminal that is itself inside a systemd scope (a desktop launcher, an IDE, `systemd-run
+# --scope`) inherits all of them, so their presence alone says nothing about who will respawn it.
+_INHERITED_SUPERVISOR_ENV = (
+    "INVOCATION_ID", "JOURNAL_STREAM", "NOTIFY_SOCKET", "WATCHDOG_USEC", "WATCHDOG_PID",
+)
+
+
+def _self_cgroup_path() -> str:
+    """This process's systemd cgroup path (unified v2, else the v1 systemd hierarchy), or ""."""
+    try:
+        lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    unified = next((line[3:].strip() for line in lines if line.startswith("0::")), "")
+    legacy = next((line.split(":", 2)[2].strip() for line in lines if ":name=systemd:" in line), "")
+    return unified or legacy or ""
+
+
+def _self_cgroup_unit() -> str:
+    """The leaf unit of this process's cgroup (``hermes-gateway.service``, ``app-...scope``), or ""."""
+    return _self_cgroup_path().rsplit("/", 1)[-1]
+
+
+def systemd_service_owns_this_process(unit: str | None = None) -> bool:
+    """True when a systemd *service* with a restart policy owns this process.
+
+    Inherited ``INVOCATION_ID`` is no evidence: a terminal tab's shell carries one, and its
+    transient ``.scope`` never respawns anything. Only a ``.service`` unit whose MainPID is this
+    process (or the non-exec wrapper it will exit with) and whose ``Restart=`` is not ``no``
+    brings the gateway back after it exits.
+    """
+    unit = _self_cgroup_unit() if unit is None else unit
+    if not unit.endswith(".service"):
+        return False
+    cgroup = _self_cgroup_path()
+    scope = ["systemctl", "--user"] if "/user@" in cgroup else ["systemctl"]
+    try:
+        main = subprocess.run(
+            [*scope, "show", unit, "--property=MainPID", "--value"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        main_pid = int((main.stdout or "0").strip() or 0)
+        if main_pid <= 0 or main_pid not in (os.getpid(), os.getppid()):
+            return False
+        restart = subprocess.run(
+            [*scope, "show", unit, "--property=Restart", "--value"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return (restart.stdout or "").strip() not in ("", "no")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def scrub_inherited_supervisor_markers() -> None:
+    """Drop supervisor markers this gateway only inherited from an enclosing unit or scope.
+
+    A ``gateway run`` started from a terminal under systemd carries ``INVOCATION_ID`` and friends.
+    Unscrubbed, the gateway identifies as ``systemd``: ``hermes update`` plans a
+    ``systemctl restart`` for a unit that does not exist, and ``hermes gateway restart`` drains it
+    and waits for a supervisor that never relaunches it (leaving the gateway down). A genuine
+    service launch keeps the markers: generated units export ``HERMES_SUPERVISED_CHILD``, and a
+    custom unit is proven by its cgroup/MainPID/Restart policy. The explicit
+    ``--external-supervisor`` opt-in is never scrubbed.
+    """
+    if not os.environ.get("INVOCATION_ID"):
+        return
+    if os.environ.get("HERMES_SUPERVISED_CHILD") or os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
+        return
+    if str(os.environ.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "")).strip().lower() in _TRUTHY:
+        return
+    if systemd_service_owns_this_process():
+        return
+    for name in _INHERITED_SUPERVISOR_ENV:
+        os.environ.pop(name, None)
+
+
 def is_gateway_supervisor_process(environ: Mapping[str, str] | None = None) -> bool:
     """Return whether this gateway process is owned by a supervisor that RESTARTS it.
 
@@ -254,6 +332,13 @@ def is_gateway_supervisor_process(environ: Mapping[str, str] | None = None) -> b
     return bool(env.get("INVOCATION_ID") or env.get("HERMES_S6_SUPERVISED_CHILD") or (xpc_service and xpc_service != "0")
                 or launchd_job_label(env)
                 or str(env.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "")).strip().lower() in _TRUTHY)
+
+
+def running_under_gateway_supervisor(environ: Mapping[str, str] | None = None) -> bool:
+    """True when this process IS the supervisor-launched gateway, so the conflict guard never wedges
+    the service into a respawn/refuse loop. Markers: systemd INVOCATION_ID, launchd XPC_SERVICE_NAME
+    (shells inherit "0"), s6 HERMES_S6_SUPERVISED_CHILD, or ``--external-supervisor``."""
+    return is_gateway_supervisor_process(environ)
 
 
 def is_supervised_gateway_launch(environ: Mapping[str, str] | None = None) -> bool:

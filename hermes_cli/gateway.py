@@ -40,12 +40,13 @@ from gateway.restart import (
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
-    is_gateway_supervisor_process,
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
     resolve_restart_exit_wait_budget,
     resolve_systemd_timeout_stop_sec,
+    running_under_gateway_supervisor as _running_under_gateway_supervisor,
+    scrub_inherited_supervisor_markers,
 )
 from hermes_cli.config import (
     get_env_value,
@@ -4056,13 +4057,6 @@ def _is_official_docker_checkout() -> bool:
     return str(PROJECT_ROOT) == "/opt/hermes" and (PROJECT_ROOT / "docker" / "entrypoint.sh").is_file()
 
 
-def _running_under_gateway_supervisor() -> bool:
-    """True when this process IS the supervisor-launched gateway, so the conflict guard never wedges
-    the service into a respawn/refuse loop. Markers: systemd INVOCATION_ID, launchd XPC_SERVICE_NAME
-    (shells inherit "0"), s6 HERMES_S6_SUPERVISED_CHILD, or ``--external-supervisor``."""
-    return is_gateway_supervisor_process()
-
-
 def host_multiplexer_serving(profile_name: str | None = None):
     """The ONE live host gateway when it serves ``profile_name`` (default: the current profile).
 
@@ -4553,6 +4547,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
     (``gateway.unmanaged_idle_exit_seconds``)."""
+    # Before any supervisor/ownership guard reads the launch env.
+    scrub_inherited_supervisor_markers()
     _guard_official_docker_root_gateway()
     _attach_to_host_gateway_or_guard(force=force, replace=replace)
     _guard_supervised_gateway_conflict(force=force)
